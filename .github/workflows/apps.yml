@@ -1,0 +1,107 @@
+# Nori's apps for Windows, macOS and Linux, built from the private repo Riscooo/nori (checked
+# out with a read-only deploy key, NORI_DEPLOY_KEY) and published here as release vX.Y.Z,
+# with the latest.json the apps read to update themselves. Actions only runs in this
+# account's public repos, hence here. `npm run apps` in Riscooo/nori starts it:
+#   gh workflow run apps.yml -R Riscooo/nori-descargas -f etiqueta=app-vX.Y.Z
+name: Apps
+run-name: Nori ${{ inputs.etiqueta }}
+on:
+  workflow_dispatch:
+    inputs:
+      etiqueta:
+        description: "Etiqueta de Riscooo/nori (app-vX.Y.Z, la versión de desktop/src-tauri/tauri.conf.json)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  compilar:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            plat: windows
+            args: --bundles nsis
+          - os: macos-latest
+            plat: macos
+            args: --target universal-apple-darwin --bundles app,dmg
+          # The oldest Ubuntu GitHub has: the AppImage runs where glibc is as new or newer.
+          - os: ubuntu-22.04
+            plat: linux
+            args: --bundles appimage
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: nori/desktop
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Riscooo/nori
+          ref: refs/tags/${{ inputs.etiqueta }}
+          ssh-key: ${{ secrets.NORI_DEPLOY_KEY }}
+          persist-credentials: false
+          path: nori
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: nori/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.plat == 'macos' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nori/desktop/src-tauri -> target
+      - name: Dependencias de Linux
+        if: matrix.plat == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
+          # Into the AppImage (bundleMediaFramework): Nori's videos and the pomodoro's chime.
+          sudo apt-get install -y gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav
+      - run: npm ci
+      - name: La etiqueta y la versión de la app coinciden
+        shell: bash
+        env:
+          ETIQUETA: ${{ inputs.etiqueta }}
+        run: |
+          V=$(node -p 'require("./src-tauri/tauri.conf.json").version')
+          [ "app-v$V" = "$ETIQUETA" ] || { echo "La etiqueta es $ETIQUETA y la app dice $V"; exit 1; }
+      # Once is enough.
+      - name: Pruebas
+        if: matrix.plat == 'linux'
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Compilar
+        run: npx tauri build ${{ matrix.args }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nori-${{ matrix.plat }}
+          path: |
+            nori/desktop/src-tauri/target/**/release/bundle/nsis/*-setup.exe*
+            nori/desktop/src-tauri/target/**/release/bundle/dmg/*.dmg
+            nori/desktop/src-tauri/target/**/release/bundle/macos/*.app.tar.gz*
+            nori/desktop/src-tauri/target/**/release/bundle/appimage/*.AppImage*
+          if-no-files-found: error
+
+  publicar:
+    needs: compilar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nori-*
+          path: compilado
+      - name: Release y latest.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ETIQUETA: ${{ inputs.etiqueta }}
+        run: node publicar.mjs compilado "$ETIQUETA"
